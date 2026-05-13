@@ -192,8 +192,14 @@ class SwarmApp(App[None]):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("ctrl+c", "quit", "Quit", show=False),
         Binding("ctrl+n", "next_agent", "Next"),
         Binding("ctrl+p", "prev_agent", "Prev"),
+        Binding("ctrl+b", "select_boss", "Boss", show=True),
+        Binding("ctrl+h", "show_help", "Help"),
+        Binding("escape", "focus_input", show=False),
+        Binding("ctrl+x", "cancel_agent", "Cancel"),
+        Binding("ctrl+l", "clear_chat", "Clear"),
     ]
 
     selected_agent: reactive[str] = reactive("boss")
@@ -244,6 +250,12 @@ class SwarmApp(App[None]):
         log.write("Welcome! Tell me what you want to build and")
         log.write("I'll assemble a team of specialist agents.")
         log.write("")
+        log.write(Text.assemble(
+            ("Type ", "dim"),
+            ("/help", "bold cyan"),
+            (" for commands, or just describe your project.", "dim"),
+        ))
+        log.write("")
         self.query_one("#chat-input", Input).focus()
 
     # ── agent selection ──────────────────────────────────────
@@ -282,6 +294,185 @@ class SwarmApp(App[None]):
         idx = self._agent_order.index(self.selected_agent)
         self.selected_agent = self._agent_order[(idx - 1) % len(self._agent_order)]
 
+    # ── slash commands ───────────────────────────────────────
+
+    COMMANDS: dict[str, str] = {
+        "/help":       "Show all commands and shortcuts",
+        "/quit":       "Exit agent-swarm",
+        "/status":     "Show status of all agents",
+        "/agents":     "List all agents",
+        "/boss":       "Switch to Boss chat",
+        "/cancel":     "Cancel the current agent's task",
+        "/cancel-all": "Cancel all running agents",
+        "/clear":      "Clear the current chat window",
+        "/plan":       "Show the current plan",
+    }
+
+    def _handle_command(self, cmd: str) -> bool:
+        """Handle a /command. Returns True if it was a command."""
+        parts = cmd.split(maxsplit=1)
+        command = parts[0].lower()
+        log = self._chat_logs.get(self.selected_agent)
+
+        if command == "/help":
+            self._show_help()
+        elif command == "/quit" or command == "/exit" or command == "/q":
+            self.exit()
+        elif command == "/status":
+            self._show_status()
+        elif command == "/agents":
+            self._show_agents()
+        elif command == "/boss":
+            self.selected_agent = "boss"
+        elif command == "/cancel":
+            self._cancel_current_agent()
+        elif command == "/cancel-all":
+            self._cancel_all_agents()
+        elif command == "/clear":
+            self.action_clear_chat()
+        elif command == "/plan":
+            self._show_current_plan()
+        elif command.startswith("/"):
+            if log:
+                log.write(Text(f"Unknown command: {command}. Type /help", style="dim red"))
+        else:
+            return False
+        return True
+
+    def _show_help(self) -> None:
+        """Display help in the current chat."""
+        log = self._chat_logs.get(self.selected_agent)
+        if not log:
+            return
+        log.write("")
+        log.write(Text("Commands", style="bold #a855f7"))
+        log.write(Text("────────", style="#30363d"))
+        for cmd, desc in self.COMMANDS.items():
+            log.write(Text.assemble(
+                (f"  {cmd:<14}", "bold cyan"),
+                (desc, ""),
+            ))
+        log.write("")
+        log.write(Text("Keyboard Shortcuts", style="bold #a855f7"))
+        log.write(Text("──────────────────", style="#30363d"))
+        shortcuts = [
+            ("Ctrl+Q", "Quit"),
+            ("Ctrl+C", "Quit"),
+            ("Ctrl+N", "Next agent"),
+            ("Ctrl+P", "Previous agent"),
+            ("Ctrl+B", "Jump to Boss"),
+            ("Ctrl+H", "Show this help"),
+            ("Ctrl+X", "Cancel current agent"),
+            ("Ctrl+L", "Clear chat"),
+            ("Escape", "Focus input bar"),
+        ]
+        for key, desc in shortcuts:
+            log.write(Text.assemble(
+                (f"  {key:<14}", "bold cyan"),
+                (desc, ""),
+            ))
+        log.write("")
+
+    def _show_status(self) -> None:
+        """Show all agent statuses."""
+        log = self._chat_logs.get(self.selected_agent)
+        if not log:
+            return
+        log.write("")
+        log.write(Text("Agent Status", style="bold #a855f7"))
+        log.write(Text("────────────", style="#30363d"))
+        for name, btn in self._agent_buttons.items():
+            icon = STATUS_ICON.get(btn.status, "○")
+            style = STATUS_STYLE.get(btn.status, "dim")
+            log.write(Text.assemble(
+                (f"  {icon} ", style),
+                (f"{name:<16}", "bold"),
+                (f"{btn.role:<14}", "dim"),
+                (btn.status, style),
+            ))
+        log.write("")
+
+    def _show_agents(self) -> None:
+        """List all agents with their roles."""
+        log = self._chat_logs.get(self.selected_agent)
+        if not log:
+            return
+        log.write("")
+        for i, name in enumerate(self._agent_order):
+            btn = self._agent_buttons.get(name)
+            if btn:
+                marker = " ◂" if name == self.selected_agent else ""
+                log.write(Text.assemble(
+                    (f"  {i}. ", "bold cyan"),
+                    (name, "bold"),
+                    (f"  ({btn.role})", "dim"),
+                    (marker, "#a855f7"),
+                ))
+        log.write(Text("  Use Ctrl+N/P to switch or click in sidebar.", style="dim"))
+        log.write("")
+
+    def _cancel_current_agent(self) -> None:
+        """Cancel the currently selected agent."""
+        name = self.selected_agent
+        log = self._chat_logs.get(name)
+        if name == "boss":
+            if log:
+                log.write(Text("Can't cancel the Boss.", style="dim yellow"))
+            return
+        if self.swarm:
+            agent = self.swarm.agents.get(name)
+            if agent and agent.status == AgentStatus.WORKING:
+                asyncio.create_task(agent.cancel())
+                btn = self._agent_buttons.get(name)
+                if btn:
+                    btn.status = "failed"
+                if log:
+                    log.write(Text("✗ Cancelled.", style="bold red"))
+            elif log:
+                log.write(Text("Agent is not running.", style="dim"))
+
+    def _cancel_all_agents(self) -> None:
+        """Cancel all running agents."""
+        log = self._chat_logs.get(self.selected_agent)
+        if self.swarm:
+            asyncio.create_task(self.swarm.cancel_all())
+            for name, btn in self._agent_buttons.items():
+                if name != "boss" and btn.status == "working":
+                    btn.status = "failed"
+            if log:
+                log.write(Text("✗ All agents cancelled.", style="bold red"))
+        elif log:
+            log.write(Text("No swarm running.", style="dim"))
+
+    def _show_current_plan(self) -> None:
+        """Re-display the current plan."""
+        log = self._chat_logs.get(self.selected_agent)
+        if not log:
+            return
+        if self._current_plan:
+            self._show_plan(self._current_plan, log)
+        else:
+            log.write(Text("No plan yet. Describe your project first.", style="dim"))
+
+    # ── action methods for key bindings ──────────────────────
+
+    def action_select_boss(self) -> None:
+        self.selected_agent = "boss"
+
+    def action_focus_input(self) -> None:
+        self.query_one("#chat-input", Input).focus()
+
+    def action_cancel_agent(self) -> None:
+        self._cancel_current_agent()
+
+    def action_clear_chat(self) -> None:
+        log = self._chat_logs.get(self.selected_agent)
+        if log:
+            log.clear()
+
+    def action_show_help(self) -> None:
+        self._show_help()
+
     # ── input handling ───────────────────────────────────────
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
@@ -289,6 +480,11 @@ class SwarmApp(App[None]):
         if not text:
             return
         event.input.clear()
+
+        # Handle slash commands first
+        if text.startswith("/"):
+            self._handle_command(text)
+            return
 
         agent = self.selected_agent
         log = self._chat_logs.get(agent)
