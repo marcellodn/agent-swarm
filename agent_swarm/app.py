@@ -516,7 +516,17 @@ class SwarmApp(App[None]):
                 self._show_plan(plan, log)
                 self._phase = "confirming"
             except Exception as exc:
-                log.write(Text(f"Error: {exc}", style="bold red"))
+                err = str(exc)
+                if "rate_limit" in err.lower() or "rate limit" in err.lower() or "429" in err:
+                    log.write(Text(
+                        "Rate limited by API — wait a moment and try again.",
+                        style="bold yellow",
+                    ))
+                    log.write(Text("(Your plan request is the same, just press Enter)", style="dim"))
+                    self._last_request = text  # store for easy retry
+                else:
+                    log.write(Text(f"Error: {exc}", style="bold red"))
+                    log.write(Text("Try again or type /quit to exit.", style="dim"))
 
         elif self._phase == "confirming":
             if text.lower() in ("y", "yes"):

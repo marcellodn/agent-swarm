@@ -9,6 +9,7 @@ Responsibilities:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -19,6 +20,9 @@ from .config import AgentConfig, SwarmPlan
 from .roles import ROLES
 
 log = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_DELAY = 30  # seconds — rate limits typically need 20-60s
 
 PLAN_SYSTEM_PROMPT = """\
 You are the Boss of a multi-agent coding swarm. Your job:
@@ -57,6 +61,12 @@ Given the status of each agent and the files they created, write a
 clear summary for the user: what was built, what succeeded, what failed,
 and any next steps. Be concise and direct.
 """
+
+
+def _is_rate_limit(exc: Exception) -> bool:
+    """Check if an exception is a rate-limit error."""
+    msg = str(exc).lower()
+    return any(kw in msg for kw in ("rate_limit", "rate limit", "429", "overloaded"))
 
 
 class Boss:
@@ -106,7 +116,6 @@ class Boss:
 
     async def summarise(self, statuses: dict[str, str]) -> str:
         """Generate a human-readable summary after the swarm finishes."""
-        # Collect done-files written by agents
         done_dir = self.project_dir / "_swarm" / "done"
         summaries: dict[str, str] = {}
         if done_dir.exists():
@@ -121,51 +130,75 @@ class Boss:
 
         return await self._ask_claude(prompt, SUMMARY_SYSTEM_PROMPT)
 
-    # ── helpers ─────────────────────────────────────────────────
+    # ── helpers ─────────────────────────────────────────────
 
     async def _ask_claude(self, prompt: str, system: str) -> str:
-        """Run a one-shot Claude Code query and return the text."""
+        """Run a one-shot Claude Code query with retry on rate limits."""
         options = ClaudeCodeOptions(
             system_prompt=system,
             cwd=str(self.project_dir),
             max_turns=3,
         )
 
-        chunks: list[str] = []
-        async for msg in query(prompt=prompt, options=options):
-            text = self._extract_text(msg)
-            if text:
-                chunks.append(text)
+        last_error: Exception | None = None
 
-        return "\n".join(chunks)
+        for attempt in range(MAX_RETRIES):
+            try:
+                chunks: list[str] = []
+                async for msg in query(prompt=prompt, options=options):
+                    text = self._extract_text(msg)
+                    if text:
+                        chunks.append(text)
+
+                result = "\n".join(chunks)
+                if result.strip():
+                    return result
+
+            except Exception as exc:
+                last_error = exc
+                if _is_rate_limit(exc) and attempt < MAX_RETRIES - 1:
+                    wait = RETRY_DELAY * (attempt + 1)
+                    log.info("Rate limited, retrying in %ds (attempt %d/%d)",
+                             wait, attempt + 1, MAX_RETRIES)
+                    await asyncio.sleep(wait)
+                    continue
+                raise
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("No response from Claude after retries")
 
     @staticmethod
     def _extract_text(msg: object) -> str:
         """Pull plain text out of an SDK message.
 
-        Handles AssistantMessage (.content → list[TextBlock]),
-        ResultMessage (.result), and raw strings.
+        Silently skips unknown message types (rate_limit_event, etc.)
+        so they don't crash the pipeline.
         """
         parts: list[str] = []
 
-        if hasattr(msg, "content"):
-            content = msg.content
-            if isinstance(content, str):
-                parts.append(content)
-            elif isinstance(content, list):
-                for block in content:
-                    if hasattr(block, "text"):
-                        parts.append(block.text)
+        try:
+            if hasattr(msg, "content"):
+                content = msg.content
+                if isinstance(content, str):
+                    parts.append(content)
+                elif isinstance(content, list):
+                    for block in content:
+                        if hasattr(block, "text"):
+                            parts.append(block.text)
 
-        if hasattr(msg, "result") and msg.result:
-            parts.append(str(msg.result))
+            if hasattr(msg, "result") and msg.result:
+                parts.append(str(msg.result))
+        except Exception:
+            pass  # skip unparseable messages
 
         return "\n".join(parts)
 
     def _parse_plan(self, raw: str) -> SwarmPlan:
         """Extract JSON from Claude's response and build a SwarmPlan."""
-        # Claude sometimes wraps JSON in markdown code fences
         text = raw.strip()
+
+        # Claude sometimes wraps JSON in markdown code fences
         if "```" in text:
             blocks = text.split("```")
             for block in blocks:
@@ -175,6 +208,12 @@ class Boss:
                 if block.startswith("{"):
                     text = block
                     break
+
+        # Find the JSON object even if there's surrounding text
+        start = text.find("{")
+        end = text.rfind("}") + 1
+        if start >= 0 and end > start:
+            text = text[start:end]
 
         data = json.loads(text)
 

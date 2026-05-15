@@ -14,6 +14,9 @@ from .roles import build_system_prompt
 
 log = logging.getLogger(__name__)
 
+MAX_RETRIES = 3
+RETRY_DELAY = 30
+
 
 class Agent:
     """Lifecycle wrapper around one Claude Code agent session."""
@@ -114,15 +117,38 @@ class Agent:
             ))
 
     async def _execute(self, prompt: str) -> None:
-        """Run a single Claude Code query and stream output to the bus."""
+        """Run a Claude Code query with retry on rate limits."""
         options = ClaudeCodeOptions(
             system_prompt=self._system_prompt,
             cwd=str(self.project_dir),
             allowed_tools=list(self.cfg.allowed_tools),
             max_turns=self.cfg.max_turns,
         )
-        async for msg in query(prompt=prompt, options=options):
-            await self._handle_sdk_message(msg)
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                async for msg in query(prompt=prompt, options=options):
+                    await self._handle_sdk_message(msg)
+                return  # success
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                msg_str = str(exc).lower()
+                is_rate_limit = any(
+                    kw in msg_str
+                    for kw in ("rate_limit", "rate limit", "429", "overloaded")
+                )
+                if is_rate_limit and attempt < MAX_RETRIES - 1:
+                    wait = RETRY_DELAY * (attempt + 1)
+                    await self.bus.send(Message(
+                        sender=self.name,
+                        recipient="*",
+                        content=f"Rate limited — retrying in {wait}s...",
+                        msg_type=MessageType.STATUS,
+                    ))
+                    await asyncio.sleep(wait)
+                    continue
+                raise
 
     async def _handle_sdk_message(self, msg: object) -> None:
         """Extract text and stream it to the bus."""
